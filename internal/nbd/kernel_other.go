@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !windows
 
 package nbd
 
@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// ErrUnsupported is returned on platforms without the Linux NBD driver.
-var ErrUnsupported = errors.New("attaching NBD devices requires Linux")
+// ErrUnsupported is returned on platforms without an NBD kernel driver.
+var ErrUnsupported = errors.New("attaching NBD devices requires Linux (nbd) or Windows (WNBD)")
 
 // Attach is only available on Linux.
 func Attach(device, addr, export string, timeout time.Duration) error { return ErrUnsupported }

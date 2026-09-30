@@ -142,6 +142,8 @@ type Cache struct {
 	flushPasses  int64
 	lastFlushErr string
 
+	metaLocks [256]sync.Mutex // striped by metadata sector
+
 	bufPool sync.Pool
 	stats   counters
 	opened  time.Time
@@ -380,10 +382,7 @@ func (c *Cache) Start() error {
 	c.started = true
 	c.mu.Unlock()
 	for _, idx := range orphans {
-		s := &c.slots[idx]
-		s.mu.Lock()
-		_ = c.writeMeta(idx, metaEntry{})
-		s.mu.Unlock()
+		_ = c.updateMeta(idx, nil)
 	}
 	c.wg.Add(1)
 	go c.flusherLoop()
@@ -450,18 +449,12 @@ func (c *Cache) persistAllMeta() error {
 		}
 		c.mu.Lock()
 		for i := uint64(0); i < n; i++ {
-			s := &c.slots[start+i]
-			var m metaEntry
-			if s.state == stateValid {
-				m = metaEntry{Vol: s.key.Vol, Flags: metaValid, Block: s.key.Block, CRC: s.crc, Stamp: s.stamp}
-				if s.dirty {
-					m.Flags |= metaDirty
-				}
-			}
-			m.encode(buf[i*metaEntrySize:])
+			c.slots[start+i].meta().encode(buf[i*metaEntrySize:])
 		}
 		c.mu.Unlock()
-		if _, err := c.dev.WriteAt(buf[:n*metaEntrySize], c.layout.metaOffset(uint32(start))); err != nil {
+		size := alignUp(int64(n)*metaEntrySize, metaSectorSize)
+		clear(buf[n*metaEntrySize : size])
+		if _, err := c.dev.WriteAt(buf[:size], c.layout.metaOffset(uint32(start))); err != nil {
 			return fmt.Errorf("persist metadata: %w", err)
 		}
 	}
@@ -634,13 +627,15 @@ func (c *Cache) evictLocked(idx uint32) {
 	s.dirty = false
 }
 
-// unbind drops a pinned slot from the index (e.g. after an I/O error). The
-// caller must hold slot.mu and its pin; the slot returns to the free list
-// when the last pin is released.
+// unbind drops a pinned slot from the index (e.g. after an I/O error) and
+// invalidates its on-disk metadata. The caller must hold slot.mu and its
+// pin; the slot returns to the free list when the last pin is released.
 func (c *Cache) unbind(idx uint32) {
-	c.mu.Lock()
-	s := &c.slots[idx]
-	if s.state != stateFree {
+	_ = c.updateMeta(idx, func() bool {
+		s := &c.slots[idx]
+		if s.state == stateFree {
+			return false
+		}
 		delete(c.index, s.key)
 		c.lruRemove(idx)
 		if s.dirty {
@@ -656,8 +651,8 @@ func (c *Cache) unbind(idx uint32) {
 		}
 		s.state = stateFree
 		s.dirty = false
-	}
-	c.mu.Unlock()
+		return true
+	})
 }
 
 func (c *Cache) release(idx uint32) {
@@ -678,11 +673,48 @@ func (c *Cache) releaseLocked(idx uint32) {
 	}
 }
 
-// writeMeta persists a slot's metadata entry. Caller holds slot.mu.
-func (c *Cache) writeMeta(idx uint32, m metaEntry) error {
-	var b [metaEntrySize]byte
-	m.encode(b[:])
-	if _, err := c.dev.WriteAt(b[:], c.layout.metaOffset(idx)); err != nil {
+// meta encodes the persisted view of a slot from its in-memory state.
+// Caller holds c.mu.
+func (s *slot) meta() metaEntry {
+	if s.state != stateValid {
+		return metaEntry{}
+	}
+	m := metaEntry{Vol: s.key.Vol, Flags: metaValid, Block: s.key.Block, CRC: s.crc, Stamp: s.stamp}
+	if s.dirty {
+		m.Flags |= metaDirty
+	}
+	return m
+}
+
+// updateMeta applies mutate to the in-memory slot state (under c.mu) and
+// then persists the whole metadata sector that contains slot idx, encoded
+// from memory. Writing full sectors keeps every cache-device write
+// sector-aligned, which raw disks on Windows require, and the per-sector
+// lock makes concurrent updates of neighbouring slots safe. When mutate
+// returns false nothing is written. Callers hold slot.mu.
+func (c *Cache) updateMeta(idx uint32, mutate func() bool) error {
+	sector := idx / metaEntriesPerSector
+	lk := &c.metaLocks[sector%uint32(len(c.metaLocks))]
+	lk.Lock()
+	defer lk.Unlock()
+
+	var buf [metaSectorSize]byte
+	c.mu.Lock()
+	if mutate != nil && !mutate() {
+		c.mu.Unlock()
+		return nil
+	}
+	first := uint64(sector) * metaEntriesPerSector
+	last := first + metaEntriesPerSector
+	if last > c.layout.SlotCount {
+		last = c.layout.SlotCount
+	}
+	for i := first; i < last; i++ {
+		c.slots[i].meta().encode(buf[(i-first)*metaEntrySize:])
+	}
+	c.mu.Unlock()
+
+	if _, err := c.dev.WriteAt(buf[:], c.layout.MetaOff+int64(sector)*metaSectorSize); err != nil {
 		c.stats.Errors.Add(1)
 		return fmt.Errorf("write slot metadata: %w", err)
 	}
@@ -859,7 +891,7 @@ func (c *Cache) DropClean(name string) (int, error) {
 	for _, idx := range victims {
 		s := &c.slots[idx]
 		s.mu.Lock()
-		_ = c.writeMeta(idx, metaEntry{})
+		_ = c.updateMeta(idx, nil)
 		s.mu.Unlock()
 		c.release(idx)
 	}

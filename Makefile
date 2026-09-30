@@ -2,7 +2,7 @@ BIN     := bin/bigcache
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X main.version=$(VERSION)
 
-.PHONY: all build test race smoke bench fmt vet clean install
+.PHONY: all build test race smoke bench fmt vet clean install release
 
 all: build
 
@@ -31,5 +31,8 @@ install: build
 	install -m 0644 examples/bigcache.service /etc/systemd/system/bigcache.service
 	install -m 0644 examples/attach@.service /etc/systemd/system/bigcache-attach@.service
 
+release:
+	./scripts/build-release.sh $(VERSION)
+
 clean:
-	rm -rf bin
+	rm -rf bin dist

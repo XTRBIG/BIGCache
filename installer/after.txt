@@ -1,0 +1,21 @@
+Next steps
+
+1. Edit C:\ProgramData\BIGCache\config.json:
+     - cache_device: a new file on the SSD, e.g. "D:\\bigcache.cache",
+       with "cache_size" (e.g. "64G"), or a raw partition.
+     - volumes[].device: the HDD, e.g. "\\\\.\\PhysicalDrive1".
+       Find the number in Disk Management. Take the disk OFFLINE there
+       (right-click the disk -> Offline) so Windows no longer mounts it
+       directly; from now on it is accessed through the cache only.
+
+2. Start the service (Administrator command prompt):
+     bigcache service start
+   The log is in C:\ProgramData\BIGCache\bigcache.log.
+
+3. Map the cached HDD as a disk (needs the WNBD driver):
+     bigcache attach media
+   It appears in Disk Management with the same partitions and drive
+   letters as the original HDD. Unmap with "bigcache detach media".
+
+4. Watch it work:
+     bigcache stats --watch 2s

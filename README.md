@@ -2,9 +2,10 @@
 
 BIGCache turns an SSD into a persistent block cache for one or more slow
 HDDs, in the spirit of [PrimoCache](https://www.romexsoftware.com/en/primo-cache/)'s
-level‑2 cache. It runs in user space on Linux and exposes every cached HDD
-as a regular block device through the kernel's NBD driver, so any
-filesystem, VM or application can sit on top of it.
+level‑2 cache. It runs in user space on Linux and Windows and exposes every cached HDD
+as a regular block device (Linux: the kernel's NBD driver; Windows: the
+open source WNBD driver), so any filesystem, VM or application can sit on
+top of it.
 
 ```
               ┌──────────────────────── bigcache serve ────────────────────────┐
@@ -40,9 +41,36 @@ filesystem, VM or application can sit on top of it.
   `bigcache stats` / `flush` / `drop` commands.
 * **Self-contained benchmark** (`bigcache bench`) to see the hit rate and
   the effect of block size and policy without touching real disks.
-* No dependencies beyond the Go standard library.
+* Runs as a systemd service on Linux or a Windows service, with a
+  Windows installer.
 
-## Quick start
+## Downloads
+
+Pre-built binaries and the Windows installer are published on the
+[GitHub Releases](https://github.com/XTRBIG/BIGCache/releases) page for
+every version tag:
+
+| file | platform |
+|------|----------|
+| `BIGCache-Setup-<version>-windows-x64.exe` | Windows 10/11 or Server 2016+ installer (service, PATH, Start menu) |
+| `bigcache-<version>-windows-amd64.zip` / `-arm64.zip` | Windows, portable `bigcache.exe` |
+| `bigcache-<version>-linux-amd64.tar.gz` / `-arm64.tar.gz` | Linux |
+| `bigcache-<version>-darwin-*.tar.gz` | macOS (NBD server, stats and bench only; no block device front end) |
+| `SHA256SUMS.txt` | checksums |
+
+Every push to `main` also produces the same files as build artifacts on
+the [Actions](https://github.com/XTRBIG/BIGCache/actions) tab (open the
+latest *Release* run, scroll to *Artifacts*). To cut a release:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The executables are not code-signed, so Windows SmartScreen shows a
+warning on first run; choose *More info → Run anyway*, or build from
+source with `go build ./cmd/bigcache`.
+
+## Quick start (Linux)
 
 ```sh
 go build -o bigcache ./cmd/bigcache        # or: make
@@ -83,6 +111,59 @@ them back after the next start).
 You can also try it without root or real disks: the smoke test in
 `scripts/smoke.sh` creates file-backed devices, serves them on localhost and
 exercises them with the built-in NBD client.
+
+## Quick start (Windows)
+
+1. **Install the WNBD driver.** It maps NBD exports into Windows as disks
+   and is free, open source and signed:
+   <https://github.com/cloudbase/wnbd/releases> (it is also part of *Ceph
+   for Windows*). Reboot if the installer asks.
+2. **Run the BIGCache installer** (`BIGCache-Setup-<version>-windows-x64.exe`)
+   or unzip the portable build somewhere on the PATH. The installer
+   registers the `BIGCache` service and writes
+   `C:\ProgramData\BIGCache\config.json`.
+3. **Edit the configuration** (Start menu → *Edit BIGCache configuration*):
+
+   ```json
+   {
+     "cache_device": "D:\\bigcache.cache",
+     "cache_size": "64G",
+     "block_size": "64K",
+     "volumes": [
+       {"name": "media", "device": "\\\\.\\PhysicalDrive1", "write_policy": "writeback"}
+     ]
+   }
+   ```
+
+   * `cache_device`: a **new file on the SSD** is the easiest choice; it is
+     created and formatted automatically on first start with `cache_size`.
+     A raw partition (`\\.\HarddiskVolume5`) works too but must be
+     formatted with `bigcache init` and must not have a drive letter.
+   * `volumes[].device`: `\\.\PhysicalDriveN` where N is the disk number
+     shown in Disk Management. **Take that disk offline** there (right-click
+     the disk → *Offline*) so Windows stops using it directly; Windows
+     blocks raw writes to disks with mounted volumes.
+4. **Start the service and map the cached disk** from an Administrator
+   prompt:
+
+   ```bat
+   bigcache service start
+   bigcache attach media            :: appears in Disk Management with its partitions and drive letters
+   bigcache stats --watch 2s
+   ```
+
+   `bigcache detach media` unmaps the disk; `bigcache service stop` writes
+   all dirty blocks back to the HDD and stops the service. The log is in
+   `C:\ProgramData\BIGCache\bigcache.log`, and service failures are also
+   in the Windows Event Log (source *BIGCache*).
+
+The portable build can also run in the foreground without a service:
+`bigcache serve -c config.json`. The service can be managed with
+`bigcache service install|uninstall|start|stop|status`.
+
+Because WNBD reconnects to `127.0.0.1:10809` on its own, keep the `listen`
+address on the loopback interface; the NBD protocol has no
+authentication.
 
 ## How it works
 
@@ -193,8 +274,9 @@ the cache (flush dirty blocks first by stopping `serve` normally).
 | `bigcache flush [--volume NAME]` | Write dirty blocks back now. |
 | `bigcache drop [--volume NAME]` | Drop clean cached blocks (e.g. before a benchmark). |
 | `bigcache list [--server ADDR]` | List NBD exports. |
-| `bigcache attach NAME /dev/nbdN` | Attach an export with the kernel NBD driver (Linux, root). Blocks until detached. |
-| `bigcache detach /dev/nbdN` | Disconnect a device. |
+| `bigcache attach NAME [DEVICE]` | Attach an export as a disk. Linux: `DEVICE` is `/dev/nbdN` (root, blocks until detached). Windows: via WNBD, `DEVICE` is an optional instance name. |
+| `bigcache detach DEVICE` | Disconnect a device. |
+| `bigcache service install\|uninstall\|start\|stop\|status` | Manage the Windows service. |
 | `bigcache bench [flags]` | Self-contained benchmark with temporary devices. |
 
 The control API (`GET /api/v1/stats`, `GET /api/v1/volumes`,
@@ -203,10 +285,16 @@ returns JSON and is easy to scrape.
 
 ## Running as a service
 
-`examples/bigcache.service` runs the daemon under systemd and
+**Linux:** `examples/bigcache.service` runs the daemon under systemd and
 `examples/config.json` is a complete configuration. After
-`systemctl enable --now bigcache`, attach devices from another unit or from
-`/etc/rc.local` with `bigcache attach` or `nbd-client`.
+`systemctl enable --now bigcache`, attach devices with
+`systemctl enable --now bigcache-attach@media:nbd0` (unit in
+`examples/attach@.service`), or with `bigcache attach` / `nbd-client`.
+
+**Windows:** the installer (or `bigcache service install`) registers a
+service that starts automatically, logs to
+`%ProgramData%\BIGCache\bigcache.log` and writes dirty blocks back when
+it is stopped. `examples/config.windows.json` is a complete configuration.
 
 ## Durability model
 
@@ -225,10 +313,14 @@ returns JSON and is easy to scrape.
 
 ## Limitations
 
-* Linux only for the block device front end (the NBD server also works
-  with qemu, `nbdfuse` and other NBD clients on any OS). There is no
-  Windows filter driver; a kernel driver is what PrimoCache adds that a
-  user-space program cannot.
+* The block device front end needs a kernel NBD driver: `nbd` on Linux,
+  WNBD on Windows. The NBD server itself works with qemu, `nbdfuse` and
+  other NBD clients on any OS. PrimoCache's own filter driver caches a
+  disk in place; BIGCache instead presents the cached HDD as a new disk
+  and the original must be taken offline.
+* On Windows all requests reaching raw disks must be sector aligned; the
+  NBD front end guarantees this and BIGCache itself only issues aligned
+  I/O, but a custom NBD client with unaligned requests gets EIO.
 * Whole-block granularity: partial writes to uncached blocks read the rest
   of the block from the HDD first.
 * No dedicated RAM (level‑1) cache; the kernel page cache above the NBD
@@ -244,7 +336,13 @@ returns JSON and is easy to scrape.
 make test          # unit tests with the race detector
 make smoke         # end-to-end test with file-backed devices
 make bench         # in-memory benchmark
+make release       # cross-compile all platforms into dist/
 ```
+
+The Windows installer is built with Inno Setup from `installer/bigcache.iss`
+(`ISCC.exe /DAppVersion=1.2.3 installer\bigcache.iss` after
+`scripts/build-release.sh`); the release workflow does this on a Windows
+runner.
 
 The engine (`internal/cache`) is independent of NBD and can be embedded:
 `cache.Open` a formatted backend, `AttachVolume` your `backend.Backend`

@@ -25,8 +25,12 @@ const (
 	superblockSize = 4096
 	tableSize      = 64 << 10
 	metaEntrySize  = 32
-	magic          = "BIGCACH1"
-	formatVersion  = 1
+	// Metadata is read and written in whole sectors so that all I/O to the
+	// cache device is aligned.
+	metaSectorSize       = 4096
+	metaEntriesPerSector = metaSectorSize / metaEntrySize
+	magic                = "BIGCACH1"
+	formatVersion        = 1
 
 	sbFlagClean = 1 // set on clean shutdown, cleared while the cache is open
 
@@ -55,6 +59,12 @@ func (l Layout) metaOffset(idx uint32) int64 {
 	return l.MetaOff + int64(idx)*metaEntrySize
 }
 
+// metaBytes is the size of the metadata region rounded up to whole sectors.
+func (l Layout) metaBytes() int64 {
+	sectors := (int64(l.SlotCount) + metaEntriesPerSector - 1) / metaEntriesPerSector
+	return sectors * metaSectorSize
+}
+
 // ComputeLayout fits as many slots as possible on a device of the given size.
 func ComputeLayout(devSize int64, blockSize uint32) (Layout, error) {
 	if blockSize < 4096 || blockSize&(blockSize-1) != 0 {
@@ -71,7 +81,7 @@ func ComputeLayout(devSize int64, blockSize uint32) (Layout, error) {
 		if slots <= 0 {
 			return Layout{}, fmt.Errorf("device too small for a single %d byte block", blockSize)
 		}
-		dataOff = alignUp(hdr+slots*metaEntrySize, bs)
+		dataOff = alignUp(hdr+alignUp(slots*metaEntrySize, metaSectorSize), bs)
 		if dataOff+slots*bs <= devSize {
 			break
 		}
@@ -344,7 +354,8 @@ func forEachMeta(dev backend.Backend, l Layout, fn func(idx uint32, m metaEntry)
 		if start+n > l.SlotCount {
 			n = l.SlotCount - start
 		}
-		b := buf[:n*metaEntrySize]
+		// Whole sectors: the region is padded, see Layout.metaBytes.
+		b := buf[:alignUp(int64(n)*metaEntrySize, metaSectorSize)]
 		if _, err := dev.ReadAt(b, l.metaOffset(uint32(start))); err != nil {
 			return fmt.Errorf("read metadata: %w", err)
 		}

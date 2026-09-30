@@ -237,25 +237,25 @@ func (c *Cache) markClean(it *flushItem) bool {
 	s := &c.slots[it.idx]
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c.mu.Lock()
-	if s.state != stateValid || s.key != it.key || !s.dirty || s.writeGen != it.gen {
-		c.mu.Unlock()
-		return false
-	}
-	s.dirty = false
-	delete(c.dirtySet, it.idx)
-	v := c.volumes[it.key.Vol]
-	m := metaEntry{Vol: it.key.Vol, Flags: metaValid, Block: it.key.Block, CRC: s.crc, Stamp: s.stamp}
-	c.mu.Unlock()
-	if v != nil {
-		v.dirty.Add(-1)
-		v.stats.Flushed.Add(1)
-	}
-	c.stats.Flushed.Add(1)
-	if err := c.writeMeta(it.idx, m); err != nil {
+	cleaned := false
+	err := c.updateMeta(it.idx, func() bool {
+		if s.state != stateValid || s.key != it.key || !s.dirty || s.writeGen != it.gen {
+			return false
+		}
+		s.dirty = false
+		delete(c.dirtySet, it.idx)
+		if v := c.volumes[it.key.Vol]; v != nil {
+			v.dirty.Add(-1)
+			v.stats.Flushed.Add(1)
+		}
+		c.stats.Flushed.Add(1)
+		cleaned = true
+		return true
+	})
+	if err != nil {
 		c.log.Printf("cache: %v (block %+v will be written back again after a restart)", err, it.key)
 	}
-	return true
+	return cleaned
 }
 
 // flushSlot synchronously writes one dirty block back (eviction path). The

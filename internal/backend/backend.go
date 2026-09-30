@@ -49,24 +49,14 @@ func OpenFile(path string, readOnly bool) (*File, error) {
 	return &File{f: f, size: size, path: path}, nil
 }
 
-// deviceSize works for regular files and block devices: block devices report
-// a zero size from Stat but support seeking to the end.
+// deviceSize works for regular files and block devices. Regular files report
+// their size from Stat; block devices are handled per platform (see
+// size_unix.go and size_windows.go).
 func deviceSize(f *os.File) (int64, error) {
-	st, err := f.Stat()
-	if err != nil {
-		return 0, err
-	}
-	if st.Mode().IsRegular() {
+	if st, err := f.Stat(); err == nil && st.Mode().IsRegular() {
 		return st.Size(), nil
 	}
-	end, err := f.Seek(0, io.SeekEnd)
-	if err != nil {
-		return 0, err
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return 0, err
-	}
-	return end, nil
+	return blockDeviceSize(f)
 }
 
 // CreateFile creates (or truncates) a sparse regular file of the given size.

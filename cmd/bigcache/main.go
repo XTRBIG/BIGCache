@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -38,8 +39,11 @@ Usage:
   bigcache flush    [--control ADDR] [--volume NAME]
   bigcache drop     [--control ADDR] [--volume NAME]   drop clean cached blocks
   bigcache list     [--server ADDR]            list NBD exports
-  bigcache attach   NAME /dev/nbdN [--server ADDR]     attach an export (Linux, root)
-  bigcache detach   /dev/nbdN
+  bigcache attach   NAME [DEVICE] [--server ADDR]      attach an export as a disk
+                    Linux: DEVICE is /dev/nbdN (root, nbd module)
+                    Windows: DEVICE is an optional WNBD instance name
+  bigcache detach   DEVICE
+  bigcache service  install|uninstall|start|stop|status [-c CONFIG]   (Windows)
   bigcache bench    [flags]                    self-contained benchmark
   bigcache version
 
@@ -72,6 +76,8 @@ func main() {
 		err = cmdAttach(os.Args[2:])
 	case "detach":
 		err = cmdDetach(os.Args[2:])
+	case "service":
+		err = cmdService(os.Args[2:])
 	case "bench":
 		err = cmdBench(os.Args[2:])
 	case "version":
@@ -89,7 +95,7 @@ func main() {
 }
 
 func configFlag(fs *flag.FlagSet) *string {
-	return fs.String("c", "/etc/bigcache/config.json", "configuration file")
+	return fs.String("c", defaultConfigPath(), "configuration file")
 }
 
 // ---- init ----
@@ -253,19 +259,49 @@ func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfgPath := configFlag(fs)
 	discard := fs.Bool("discard-orphan-dirty", false, "discard dirty blocks of volumes that are no longer configured")
+	logPath := fs.String("log", "", "append log output to this file (default: stderr, or the platform log file when running as a service)")
 	fs.Parse(args)
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
 	}
+	service := runningAsService()
+	if *logPath == "" && service {
+		*logPath = defaultLogPath()
+	}
 	logger := log.Default()
-	e, err := openEngine(cfg, *discard, logger)
+	if *logPath != "" {
+		if err := os.MkdirAll(filepath.Dir(*logPath), 0o755); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return fmt.Errorf("open log file: %w", err)
+		}
+		defer f.Close()
+		logger = log.New(f, "", log.LstdFlags|log.Lmsgprefix)
+		log.SetOutput(f)
+	}
+	run := func(stop <-chan struct{}) error { return runServe(cfg, *discard, logger, stop) }
+	if service {
+		return runAsService(run)
+	}
+	return run(nil)
+}
+
+// runServe runs the daemon until a signal arrives or stop is closed.
+func runServe(cfg *config.Config, discard bool, logger *log.Logger, stop <-chan struct{}) error {
+	if err := autoInit(cfg, logger); err != nil {
+		return err
+	}
+	e, err := openEngine(cfg, discard, logger)
 	if err != nil {
 		return err
 	}
 	c := e.cache
 	l := c.Layout()
 	rep := c.Recovery()
+	logger.Printf("bigcache %s starting", version)
 	logger.Printf("cache %s: %d slots x %s = %s, clean_shutdown=%v restored=%d dirty=%d",
 		cfg.CacheDevice, l.SlotCount, units.FormatSize(int64(l.BlockSize)),
 		units.FormatSize(int64(l.SlotCount)*int64(l.BlockSize)), rep.CleanShutdown, rep.Restored, rep.RestoredDirty)
@@ -297,10 +333,13 @@ func cmdServe(args []string) error {
 	}()
 
 	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	select {
 	case sig := <-sigCh:
 		logger.Printf("received %s, shutting down", sig)
+	case <-stop:
+		logger.Printf("stop requested, shutting down")
 	case err := <-errCh:
 		if err != nil {
 			logger.Printf("server error: %v", err)
@@ -317,6 +356,32 @@ func cmdServe(args []string) error {
 		return fmt.Errorf("shutdown: %w", err)
 	}
 	logger.Printf("cache closed cleanly")
+	return nil
+}
+
+// autoInit creates and formats a file-backed cache when cache_device does
+// not exist yet and cache_size is configured. Existing devices are never
+// touched; those need an explicit "bigcache init".
+func autoInit(cfg *config.Config, logger *log.Logger) error {
+	if _, err := os.Stat(cfg.CacheDevice); !errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if cfg.CacheSizeBytes() == 0 {
+		return fmt.Errorf("cache device %s does not exist (set cache_size to create a file-backed cache, or run 'bigcache init')", cfg.CacheDevice)
+	}
+	if err := os.MkdirAll(filepath.Dir(cfg.CacheDevice), 0o755); err != nil {
+		return err
+	}
+	dev, err := backend.CreateFile(cfg.CacheDevice, cfg.CacheSizeBytes())
+	if err != nil {
+		return err
+	}
+	defer dev.Close()
+	l, err := cache.Format(dev, cfg.BlockSizeBytes())
+	if err != nil {
+		return err
+	}
+	logger.Printf("created cache file %s: %d slots x %s", cfg.CacheDevice, l.SlotCount, units.FormatSize(int64(l.BlockSize)))
 	return nil
 }
 
@@ -447,24 +512,29 @@ func cmdAttach(args []string) error {
 	srv := serverFlag(fs)
 	timeout := fs.Duration("timeout", 0, "kernel request timeout (0 = none)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: bigcache attach NAME /dev/nbdN [--server ADDR]")
+		fmt.Fprintln(os.Stderr, attachUsage)
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
-	if fs.NArg() != 2 {
+	dev, ok := attachDevice(fs.Arg(0), fs.Arg(1))
+	if fs.NArg() < 1 || fs.NArg() > 2 || !ok {
 		fs.Usage()
 		os.Exit(2)
 	}
-	name, dev := fs.Arg(0), fs.Arg(1)
-	log.Printf("attaching export %q from %s to %s (blocks until detached)", name, *srv, dev)
-	return nbd.Attach(dev, *srv, name, *timeout)
+	name := fs.Arg(0)
+	log.Printf("attaching export %q from %s as %s", name, *srv, dev)
+	if err := nbd.Attach(dev, *srv, name, *timeout); err != nil {
+		return err
+	}
+	log.Printf("export %q detached from %s", name, dev)
+	return nil
 }
 
 func cmdDetach(args []string) error {
 	fs := flag.NewFlagSet("detach", flag.ExitOnError)
 	fs.Parse(args)
 	if fs.NArg() != 1 {
-		return errors.New("usage: bigcache detach /dev/nbdN")
+		return errors.New("usage: bigcache detach DEVICE   (Linux: /dev/nbdN, Windows: WNBD instance name)")
 	}
 	return nbd.Detach(fs.Arg(0))
 }

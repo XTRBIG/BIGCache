@@ -1,0 +1,24 @@
+{
+  "cache_device": "D:\\bigcache.cache",
+  "cache_size": "64G",
+  "block_size": "64K",
+  "listen": "127.0.0.1:10809",
+  "control_listen": "127.0.0.1:10810",
+  "flush_interval": "10s",
+  "max_dirty_percent": 50,
+  "durable_writes": false,
+  "verify_reads": false,
+  "flush_on_exit": true,
+  "volumes": [
+    {
+      "name": "media",
+      "device": "\\\\.\\PhysicalDrive1",
+      "write_policy": "writeback"
+    },
+    {
+      "name": "backup",
+      "device": "\\\\.\\PhysicalDrive2",
+      "write_policy": "writethrough"
+    }
+  ]
+}

@@ -1,0 +1,121 @@
+# Builds downloadable binaries and the Windows installer.
+#  - on every push to main: artifacts on the Actions run (bigcache-windows-x64 etc.)
+#  - on a version tag (v1.2.3): a GitHub Release with all archives, the
+#    installer and SHA256SUMS.txt attached
+name: Release
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev.${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          fi
+
+  binaries:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: ./scripts/build-release.sh "${{ needs.version.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bigcache-windows-x64
+          path: dist/windows-amd64/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bigcache-windows-arm64
+          path: dist/windows-arm64/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bigcache-linux-x64
+          path: dist/linux-amd64/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bigcache-linux-arm64
+          path: dist/linux-arm64/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bigcache-macos
+          path: |
+            dist/darwin-amd64/
+            dist/darwin-arm64/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archives
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+
+  installer:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Build bigcache.exe
+        shell: bash
+        run: |
+          mkdir -p dist/windows-amd64
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X main.version=${{ needs.version.outputs.version }}" \
+            -o dist/windows-amd64/bigcache.exe ./cmd/bigcache
+          dist/windows-amd64/bigcache.exe version
+      - name: Run the Windows test suite
+        run: go test ./...
+      - name: Ensure Inno Setup is available
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ needs.version.outputs.version }}" installer\bigcache.iss
+          Get-ChildItem dist\*.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BIGCache-Setup-windows-x64
+          path: dist/BIGCache-Setup-*.exe
+
+  release:
+    needs: [version, binaries, installer]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: archives
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          name: BIGCache-Setup-windows-x64
+          path: release
+      - name: Checksums
+        run: cd release && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "BIGCache ${{ needs.version.outputs.version }}" \
+            --generate-notes

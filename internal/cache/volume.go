@@ -293,7 +293,6 @@ func (v *Volume) readBlock(blk uint64, inBlk int, p []byte) error {
 		// The HDD still holds the data: drop the bad copy and read it there.
 		c.log.Printf("cache: %v; falling back to HDD for %+v", err, key)
 		c.unbind(idx)
-		_ = c.writeMeta(idx, metaEntry{})
 		return v.hddRead(p, off)
 	}
 
@@ -324,25 +323,15 @@ func (v *Volume) populate(idx uint32, s *slot, key Key, buf []byte, dirty bool) 
 		return err
 	}
 	crc := crc32.ChecksumIEEE(buf)
-	c.mu.Lock()
-	stamp := s.stamp
-	c.mu.Unlock()
-	m := metaEntry{Vol: key.Vol, Flags: metaValid, Block: key.Block, CRC: crc, Stamp: stamp}
-	if dirty {
-		m.Flags |= metaDirty
-	}
-	if err := c.writeMeta(idx, m); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	s.state = stateValid
-	s.crc = crc
-	v.cached.Add(1)
-	if dirty {
-		c.markDirtyLocked(idx, s, v)
-	}
-	c.mu.Unlock()
-	return nil
+	return c.updateMeta(idx, func() bool {
+		s.state = stateValid
+		s.crc = crc
+		v.cached.Add(1)
+		if dirty {
+			c.markDirtyLocked(idx, s, v)
+		}
+		return true
+	})
 }
 
 // markDirtyLocked flags a slot dirty. Caller holds c.mu.
@@ -411,7 +400,6 @@ func (v *Volume) writeBlock(blk uint64, inBlk int, p []byte) error {
 			}
 			// Clean copy unreadable: drop it and write straight to the HDD.
 			c.unbind(idx)
-			_ = c.writeMeta(idx, metaEntry{})
 			v.stats.WriteBypass.Add(1)
 			return v.hddWrite(p, off)
 		}
@@ -466,21 +454,20 @@ func (v *Volume) writeBlock(blk uint64, inBlk int, p []byte) error {
 		}
 		wasDirty := s.dirty
 		c.unbind(idx)
-		_ = c.writeMeta(idx, metaEntry{})
 		if v.policy == PolicyWriteBack || wasDirty {
 			return v.hddWrite(img, blkOff)
 		}
 		return nil
 	}
-	c.mu.Lock()
-	stamp := s.stamp
-	c.mu.Unlock()
-	m := metaEntry{Vol: key.Vol, Flags: metaValid, Block: key.Block, CRC: crc, Stamp: stamp}
 	dirty := v.policy == PolicyWriteBack || s.dirty
-	if dirty {
-		m.Flags |= metaDirty
-	}
-	if err := c.writeMeta(idx, m); err != nil {
+	if err := c.updateMeta(idx, func() bool {
+		s.crc = crc
+		s.writeGen++
+		if dirty {
+			c.markDirtyLocked(idx, s, v)
+		}
+		return true
+	}); err != nil {
 		c.log.Printf("cache: %v; writing block %+v through to the HDD", err, key)
 		img := p
 		if !full {
@@ -489,13 +476,6 @@ func (v *Volume) writeBlock(blk uint64, inBlk int, p []byte) error {
 		c.unbind(idx)
 		return v.hddWrite(img, blkOff)
 	}
-	c.mu.Lock()
-	s.crc = crc
-	s.writeGen++
-	if dirty {
-		c.markDirtyLocked(idx, s, v)
-	}
-	c.mu.Unlock()
 	if v.policy == PolicyWriteBack && c.opts.DurableWrites {
 		return c.dev.Sync()
 	}
