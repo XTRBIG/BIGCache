@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -146,20 +147,14 @@ func cmdService(args []string) error {
 		return nil
 
 	case "uninstall":
-		s, err := m.OpenService(serviceName)
+		m.Disconnect()
+		removed, err := serviceUninstall()
 		if err != nil {
-			return fmt.Errorf("service %s is not installed", serviceName)
-		}
-		defer s.Close()
-		if st, err := s.Query(); err == nil && st.State != svc.Stopped {
-			if err := stopService(s); err != nil {
-				return err
-			}
-		}
-		if err := s.Delete(); err != nil {
 			return err
 		}
-		_ = eventlog.Remove(serviceName)
+		if !removed {
+			return fmt.Errorf("service %s is not installed", serviceName)
+		}
 		fmt.Printf("service %s removed\n", serviceName)
 		return nil
 
@@ -251,3 +246,76 @@ const exampleWindowsConfig = `{
   ]
 }
 `
+
+const onlineHint = "  (in Disk Management, right-click each disk and choose Online)"
+
+// serviceStop stops the service if it is installed and running. It
+// returns false when there was nothing to stop.
+func serviceStop() (bool, error) {
+	if !serviceInstalled() {
+		return false, nil
+	}
+	m, err := mgr.Connect()
+	if err != nil {
+		return false, fmt.Errorf("connect to the service manager (run as Administrator): %w", err)
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		return false, nil
+	}
+	defer s.Close()
+	st, err := s.Query()
+	if err != nil {
+		return false, err
+	}
+	if st.State == svc.Stopped {
+		return false, nil
+	}
+	return true, stopService(s)
+}
+
+// serviceUninstall stops and deletes the service and its event log
+// source. It returns false when the service was not installed.
+func serviceUninstall() (bool, error) {
+	if !serviceInstalled() {
+		return false, nil
+	}
+	m, err := mgr.Connect()
+	if err != nil {
+		return false, fmt.Errorf("connect to the service manager (run as Administrator): %w", err)
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		return false, nil
+	}
+	defer s.Close()
+	if st, err := s.Query(); err == nil && st.State != svc.Stopped {
+		if err := stopService(s); err != nil {
+			return false, err
+		}
+	}
+	if err := s.Delete(); err != nil {
+		return false, err
+	}
+	_ = eventlog.Remove(serviceName)
+	return true, nil
+}
+
+// serviceInstalled checks for the service with a low-privilege handle, so
+// that teardown on a portable installation does not need Administrator.
+func serviceInstalled() bool {
+	scm, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
+	if err != nil {
+		return true // cannot tell; let the privileged path report the real error
+	}
+	defer windows.CloseServiceHandle(scm)
+	name, _ := windows.UTF16PtrFromString(serviceName)
+	h, err := windows.OpenService(scm, name, windows.SERVICE_QUERY_STATUS)
+	if err != nil {
+		return !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST)
+	}
+	windows.CloseServiceHandle(h)
+	return true
+}

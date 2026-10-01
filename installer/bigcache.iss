@@ -58,10 +58,6 @@ Name: "{group}\Uninstall BIGCache"; Filename: "{uninstallexe}"
 Filename: "{app}\bigcache.exe"; Parameters: "service install -c ""{commonappdata}\BIGCache\config.json"""; StatusMsg: "Registering the BIGCache service..."; Flags: runhidden; Tasks: service
 Filename: "notepad.exe"; Parameters: """{commonappdata}\BIGCache\config.json"""; Description: "Edit the BIGCache configuration now"; Flags: postinstall nowait skipifsilent shellexec
 
-[UninstallRun]
-Filename: "{app}\bigcache.exe"; Parameters: "service stop"; Flags: runhidden; RunOnceId: "stopsvc"
-Filename: "{app}\bigcache.exe"; Parameters: "service uninstall"; Flags: runhidden; RunOnceId: "delsvc"
-
 [Registry]
 Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Tasks: path; Check: NeedsAddPath(ExpandConstant('{app}'))
 
@@ -101,4 +97,39 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
     RemoveFromPath(ExpandConstant('{app}'));
+end;
+
+// Before any file is removed: detach the cached disks, stop the service
+// (which writes dirty blocks back to the HDDs), verify that nothing is left
+// unwritten and deregister the service. The uninstall is aborted if that
+// fails, so data on the cache is never orphaned by removing the program.
+function InitializeUninstall(): Boolean;
+var
+  Params, Cfg: string;
+  ResultCode: Integer;
+begin
+  Result := True;
+  Cfg := ExpandConstant('{commonappdata}\BIGCache\config.json');
+  Params := 'teardown -c "' + Cfg + '"';
+  if MsgBox('Delete the cache file (or wipe the cache partition) named in the configuration?' + #13#10 +
+            'It is only removed after all cached writes have reached the HDDs.',
+            mbConfirmation, MB_YESNO) = IDYES then
+    Params := Params + ' --purge-cache';
+  if MsgBox('Delete the configuration and log in ' + ExpandConstant('{commonappdata}\BIGCache') + ' as well?',
+            mbConfirmation, MB_YESNO) = IDYES then
+    Params := Params + ' --purge-config';
+  if not Exec(ExpandConstant('{app}\bigcache.exe'), Params, '', SW_SHOW, ewWaitUntilTerminated, ResultCode) then
+  begin
+    MsgBox('Could not run bigcache.exe teardown. Stop the BIGCache service manually and run the uninstaller again.', mbError, MB_OK);
+    Result := False;
+    exit;
+  end;
+  if ResultCode <> 0 then
+  begin
+    MsgBox('BIGCache could not be shut down cleanly (exit code ' + IntToStr(ResultCode) + ').' + #13#10 +
+           'Cached writes may not have reached the HDDs yet. Fix the problem reported in the console window ' +
+           '(or run "bigcache teardown --force" as Administrator to discard them), then run the uninstaller again.',
+           mbError, MB_OK);
+    Result := False;
+  end;
 end;

@@ -57,4 +57,25 @@ d = open(sys.argv[1], 'rb').read()
 assert d[1_000_000:1_000_000+8] == b'BIGCACHE', d[1_000_000:1_000_000+8]
 print("HDD image contains the data written through NBD")
 PY
+# Teardown must refuse while unwritten data exists, and clean up when not.
+"$WORK/bigcache" serve -c "$WORK/config.json" > "$WORK/serve2.log" 2>&1 &
+SERVE_PID=$!
+for i in $(seq 1 50); do curl -sf http://127.0.0.1:20810/healthz >/dev/null 2>&1 && break; sleep 0.1; done
+if "$WORK/bigcache" teardown -c "$WORK/config.json" 2>"$WORK/td.err"; then
+  echo "teardown must refuse while serve is running"; exit 1
+fi
+grep -q "still running" "$WORK/td.err"
+kill -KILL $SERVE_PID; wait $SERVE_PID 2>/dev/null || true   # simulate a crash: cache left unclean
+if "$WORK/bigcache" teardown -c "$WORK/config.json" --purge-cache 2>"$WORK/td.err"; then
+  echo "teardown must refuse an unclean cache"; exit 1
+fi
+grep -q "not shut down cleanly" "$WORK/td.err" && test -f "$WORK/ssd.img"
+"$WORK/bigcache" serve -c "$WORK/config.json" > "$WORK/serve3.log" 2>&1 &
+SERVE_PID=$!
+for i in $(seq 1 50); do curl -sf http://127.0.0.1:20810/healthz >/dev/null 2>&1 && break; sleep 0.1; done
+kill -TERM $SERVE_PID; wait $SERVE_PID
+"$WORK/bigcache" teardown -c "$WORK/config.json" --purge-cache --purge-config | tee "$WORK/td.out"
+grep -q "teardown complete" "$WORK/td.out"
+test ! -e "$WORK/ssd.img" && test ! -e "$WORK/config.json"
+echo "teardown removed the cache file and configuration"
 echo "SMOKE TEST PASSED"

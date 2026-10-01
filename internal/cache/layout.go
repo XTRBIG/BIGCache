@@ -365,3 +365,25 @@ func forEachMeta(dev backend.Backend, l Layout, fn func(idx uint32, m metaEntry)
 	}
 	return nil
 }
+
+// Wipe destroys the superblock so that the device is no longer recognised
+// as a cache (used when uninstalling with a raw partition as cache device).
+// It refuses to wipe a cache that still holds dirty blocks unless force is
+// set, because those blocks have never reached the HDD.
+func Wipe(dev backend.Backend, force bool) error {
+	info, err := Inspect(dev)
+	if err != nil {
+		if errors.Is(err, ErrNotFormatted) {
+			return nil
+		}
+		if !force {
+			return err
+		}
+	} else if info.DirtySlots > 0 && !force {
+		return fmt.Errorf("cache holds %d dirty blocks that were never written to the HDD; start and cleanly stop bigcache first, or force the wipe to discard them", info.DirtySlots)
+	}
+	if _, err := dev.WriteAt(make([]byte, superblockSize), 0); err != nil {
+		return fmt.Errorf("wipe superblock: %w", err)
+	}
+	return dev.Sync()
+}

@@ -277,6 +277,7 @@ the cache (flush dirty blocks first by stopping `serve` normally).
 | `bigcache attach NAME [DEVICE]` | Attach an export as a disk. Linux: `DEVICE` is `/dev/nbdN` (root, blocks until detached). Windows: via WNBD, `DEVICE` is an optional instance name. |
 | `bigcache detach DEVICE` | Disconnect a device. |
 | `bigcache service install\|uninstall\|start\|stop\|status` | Manage the Windows service. |
+| `bigcache teardown -c CFG [--purge-cache] [--purge-config] [--force]` | Safe uninstall: detach, stop, verify clean, deregister, optionally delete cache and config. |
 | `bigcache bench [flags]` | Self-contained benchmark with temporary devices. |
 
 The control API (`GET /api/v1/stats`, `GET /api/v1/volumes`,
@@ -295,6 +296,35 @@ returns JSON and is easy to scrape.
 service that starts automatically, logs to
 `%ProgramData%\BIGCache\bigcache.log` and writes dirty blocks back when
 it is stopped. `examples/config.windows.json` is a complete configuration.
+
+## Uninstalling
+
+Removing the program while cached writes have not reached the HDDs would
+lose data, so uninstalling always goes through `bigcache teardown`, which
+runs the steps in a safe order and stops if anything is unwritten:
+
+1. detach the cached disks (WNBD instances / `bigcache-attach@` units);
+2. stop the service, which writes every dirty block back to the HDDs;
+3. inspect the cache device and refuse to continue if dirty blocks remain
+   or the cache was not shut down cleanly (`--force` discards them);
+4. deregister the service;
+5. with `--purge-cache` delete the cache file, or wipe the signature of a
+   cache partition; with `--purge-config` delete the configuration and log.
+
+**Windows:** use *Apps & Features → BIGCache → Uninstall* (or the Start
+menu entry). The uninstaller asks whether to delete the cache file and the
+configuration, runs `bigcache teardown` with those answers, and aborts
+without removing anything if the teardown fails. Afterwards bring the HDDs
+back online in Disk Management. The WNBD driver is a separate product and
+is uninstalled through its own entry.
+
+**Linux:** `sudo make uninstall` keeps the configuration and cache device;
+`sudo make purge` removes them too. Both run `bigcache teardown`, remove
+the systemd units and the binary. Mount the HDDs directly again afterwards.
+
+Running `bigcache teardown -c CONFIG` by hand does the same without
+removing the program files, which is also the way to retire a single
+installation that was never registered as a service.
 
 ## Durability model
 

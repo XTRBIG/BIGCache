@@ -44,6 +44,9 @@ Usage:
                     Windows: DEVICE is an optional WNBD instance name
   bigcache detach   DEVICE
   bigcache service  install|uninstall|start|stop|status [-c CONFIG]   (Windows)
+  bigcache teardown -c CONFIG [--purge-cache] [--purge-config] [--force]
+                    detach disks, stop + remove the service, verify nothing is
+                    unwritten, optionally delete the cache and configuration
   bigcache bench    [flags]                    self-contained benchmark
   bigcache version
 
@@ -78,6 +81,8 @@ func main() {
 		err = cmdDetach(os.Args[2:])
 	case "service":
 		err = cmdService(os.Args[2:])
+	case "teardown":
+		err = cmdTeardown(os.Args[2:])
 	case "bench":
 		err = cmdBench(os.Args[2:])
 	case "version":
