@@ -1,0 +1,23 @@
+[Unit]
+Description=BIGCache SSD cache for HDD volumes
+After=local-fs.target
+# Filesystems on /dev/nbdN must be mounted after this unit and unmounted
+# before it stops; add "x-systemd.requires=bigcache.service" to their
+# fstab options or use explicit mount units.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bigcache serve -c /etc/bigcache/config.json
+# On SIGTERM the daemon writes all dirty blocks back to the HDDs before it
+# exits; give it enough time for that.
+KillSignal=SIGTERM
+TimeoutStopSec=600
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=1
+
+[Install]
+WantedBy=multi-user.target

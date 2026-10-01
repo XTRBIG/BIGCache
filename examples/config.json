@@ -1,0 +1,29 @@
+{
+  "cache_device": "/dev/disk/by-partlabel/bigcache",
+  "block_size": "64K",
+  "listen": "127.0.0.1:10809",
+  "control_listen": "127.0.0.1:10810",
+  "flush_interval": "10s",
+  "max_dirty_percent": 50,
+  "durable_writes": false,
+  "verify_reads": false,
+  "flush_on_exit": true,
+  "volumes": [
+    {
+      "name": "media",
+      "device": "/dev/disk/by-id/ata-WDC_WD40EFRX-68N32N0_WD-WCC7K1234567",
+      "write_policy": "writeback"
+    },
+    {
+      "name": "backup",
+      "device": "/dev/disk/by-id/ata-ST8000VN004-2M2101_ZR12ABCD",
+      "write_policy": "writethrough"
+    },
+    {
+      "name": "archive",
+      "device": "/dev/disk/by-id/ata-HGST_HUH721212ALE600_8HJ0XYZA",
+      "write_policy": "none",
+      "read_only": true
+    }
+  ]
+}

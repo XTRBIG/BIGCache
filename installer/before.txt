@@ -1,0 +1,20 @@
+BIGCache uses an SSD as a persistent block cache in front of one or more
+HDDs and presents each cached HDD as a new disk.
+
+What this installer does
+  * copies bigcache.exe to Program Files\BIGCache
+  * writes an example configuration to ProgramData\BIGCache\config.json
+    (an existing configuration is kept)
+  * optionally registers the "BIGCache" Windows service
+
+What you need in addition
+  * The WNBD driver, which maps the cached disks into Windows. It is open
+    source (Ceph project) and free:
+        https://github.com/cloudbase/wnbd/releases
+    Install it, reboot if asked, and make sure wnbd-client.exe is on the
+    PATH (the WNBD installer does this).
+
+IMPORTANT: "bigcache init" and the first start of the service format the
+cache device named in the configuration. Point cache_device at a NEW file
+on your SSD (recommended, e.g. D:\bigcache.cache with cache_size) or at a
+partition whose contents you do not need.
